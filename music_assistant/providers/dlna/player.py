@@ -23,6 +23,10 @@ from music_assistant.models.player import DeviceInfo, Player
 
 from .constants import PLAYER_CONFIG_ENTRIES
 
+# How long a renderer may stay in TRANSITIONING (without offering Play) after
+# SetAVTransportURI before we consider it to be starting playback on its own.
+TRANSITIONING_GRACE_TIME = 2.0
+
 if TYPE_CHECKING:
     from async_upnp_client.client import UpnpDevice, UpnpService, UpnpStateVariable
     from music_assistant_models.config_entries import ConfigEntry
@@ -267,7 +271,7 @@ class DLNAPlayer(Player):
         self._attr_elapsed_time_last_updated = time.time()
         try:
             await self.device.async_set_transport_uri(url, title, didl_metadata)
-            await self.device.async_wait_for_can_play(10)
+            await self._wait_for_can_play(10)
             await self.device.async_play()
         except Exception:
             self._attr_playback_state = prev_state
@@ -675,3 +679,38 @@ class DLNAPlayer(Player):
             self.set_available(False)
             await old_device.async_unsubscribe_services()
         self.update_state()
+
+    async def _wait_for_can_play(self, max_wait_time: float) -> None:
+        """
+        Wait until the renderer accepts Play, or plays the new URI by itself.
+
+        :param max_wait_time: Maximum time to wait, in seconds.
+        """
+        assert self.device is not None
+        # DmrDevice.async_wait_for_can_play() only waits for Play to be offered. Some renderers
+        # (e.g. Rygel based ones such as the Sennheiser AMBEO Soundbar Mini) switch to
+        # TRANSITIONING after SetAVTransportURI, offer only Stop/Seek and start playing the
+        # (endless, flow mode) stream by themselves, so that wait always ran into its timeout
+        # and blocked every play/seek/skip for 10 seconds. Also stop waiting when the renderer
+        # plays, or keeps transitioning for a short while (async_play() then skips Play).
+        end_time = time.monotonic() + max_wait_time
+        transitioning_since: float | None = None
+        while time.monotonic() < end_time:
+            if self.device.can_play:
+                return
+            state = self.device.transport_state
+            if state == TransportState.PLAYING:
+                return
+            if state == TransportState.TRANSITIONING:
+                if transitioning_since is None:
+                    transitioning_since = time.monotonic()
+                elif time.monotonic() - transitioning_since >= TRANSITIONING_GRACE_TIME:
+                    return
+            else:
+                transitioning_since = None
+            await asyncio.sleep(0.25)
+            # poll even when subscribed: these renderers do not event their transport actions
+            with suppress(UpnpError):
+                await self.device._async_poll_state_variables(
+                    "AVT", ["GetTransportInfo", "GetCurrentTransportActions"], InstanceID=0
+                )
